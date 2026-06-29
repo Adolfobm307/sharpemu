@@ -29,6 +29,7 @@ public static class PlayGoExports
     private const int PlayGoInstallSpeedTrickle = 1;
     private const int PlayGoInstallSpeedFull = 2;
     private const uint MaxPlayGoQueryEntries = 0x4000;
+    private const uint PlayGoAllEntriesSentinel = uint.MaxValue;
 
     private static readonly Regex ChunkIdPattern = new(
         @"<chunk\s+[^>]*\bid\s*=\s*""(?<id>\d+)""",
@@ -45,6 +46,7 @@ public static class PlayGoExports
     private static int _installSpeed = PlayGoInstallSpeedTrickle;
     private static ulong _languageMask = ulong.MaxValue;
     private static int _unknownChunkDiagnostics;
+    private static int _locusTraceDiagnostics;
 
     [SysAbiExport(
         Nid = "ts6GlZOKRrE",
@@ -94,6 +96,7 @@ public static class PlayGoExports
             _languageMask = ulong.MaxValue;
             _opened = false;
             _initialized = true;
+            TracePlayGo($"initialize chunks={_metadata.ChunkIds.Length} available={_metadata.Available}");
         }
 
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -131,6 +134,7 @@ public static class PlayGoExports
             }
 
             _opened = true;
+            TracePlayGo($"open handle={PlayGoHandle} chunks={_metadata.ChunkIds.Length}");
         }
 
         Span<byte> handleBytes = stackalloc byte[sizeof(uint)];
@@ -229,6 +233,7 @@ public static class PlayGoExports
         var availableEntries = chunkIds.Length == 0 ? 1u : (uint)chunkIds.Length;
         if (outChunkIdList == 0)
         {
+            TracePlayGo($"get_chunk_id count_only entries={availableEntries} out_entries=0x{outEntries:X16}");
             return TryWriteUInt32(ctx, outEntries, availableEntries)
                 ? (int)OrbisGen2Result.ORBIS_GEN2_OK
                 : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -237,6 +242,7 @@ public static class PlayGoExports
         var entriesToWrite = Math.Min(numberOfEntries, availableEntries);
         if (entriesToWrite > MaxPlayGoQueryEntries)
         {
+            TracePlayGo($"get_chunk_id bad_size requested={numberOfEntries} available={availableEntries}");
             return OrbisPlayGoErrorBadSize;
         }
 
@@ -249,6 +255,7 @@ public static class PlayGoExports
             }
         }
 
+        TracePlayGo($"get_chunk_id write requested={numberOfEntries} wrote={entriesToWrite} available={availableEntries}");
         return TryWriteUInt32(ctx, outEntries, entriesToWrite)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -279,6 +286,7 @@ public static class PlayGoExports
 
         if (numberOfEntries == 0 || numberOfEntries > MaxPlayGoQueryEntries)
         {
+            TracePlayGo($"get_eta bad_size entries={numberOfEntries} chunk_ids=0x{chunkIds:X16} out=0x{outEta:X16}");
             return OrbisPlayGoErrorBadSize;
         }
 
@@ -376,8 +384,15 @@ public static class PlayGoExports
             return OrbisPlayGoErrorBadPointer;
         }
 
+        if (numberOfEntries == PlayGoAllEntriesSentinel)
+        {
+            TracePlayGo($"get_locus sentinel entries={numberOfEntries} chunk_ids=0x{chunkIds:X16} out=0x{outLoci:X16}");
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
         if (numberOfEntries == 0 || numberOfEntries > MaxPlayGoQueryEntries)
         {
+            TracePlayGo($"get_locus bad_size entries={numberOfEntries} chunk_ids=0x{chunkIds:X16} out=0x{outLoci:X16}");
             return OrbisPlayGoErrorBadSize;
         }
 
@@ -408,6 +423,7 @@ public static class PlayGoExports
             loci[i] = PlayGoLocusLocalFast;
         }
 
+        TracePlayGoLocus(numberOfEntries, chunkIds, outLoci);
         return ctx.Memory.TryWrite(outLoci, loci)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -438,6 +454,7 @@ public static class PlayGoExports
 
         if (numberOfEntries == 0 || numberOfEntries > MaxPlayGoQueryEntries)
         {
+            TracePlayGo($"get_progress bad_size entries={numberOfEntries} chunk_ids=0x{chunkIds:X16} out=0x{outProgress:X16}");
             return OrbisPlayGoErrorBadSize;
         }
 
@@ -447,6 +464,7 @@ public static class PlayGoExports
             return chunkError;
         }
 
+        TracePlayGo($"get_progress entries={numberOfEntries}");
         Span<byte> progress = stackalloc byte[sizeof(ulong) * 2];
         BinaryPrimitives.WriteUInt64LittleEndian(progress, 0);
         BinaryPrimitives.WriteUInt64LittleEndian(progress[sizeof(ulong)..], 0);
@@ -480,9 +498,11 @@ public static class PlayGoExports
 
         if (numberOfEntries == 0)
         {
+            TracePlayGo("get_todo bad_size entries=0");
             return OrbisPlayGoErrorBadSize;
         }
 
+        TracePlayGo($"get_todo requested={numberOfEntries} wrote=0");
         return TryWriteUInt32(ctx, outEntries, 0)
             ? (int)OrbisGen2Result.ORBIS_GEN2_OK
             : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -747,6 +767,29 @@ public static class PlayGoExports
         Span<byte> buffer = stackalloc byte[sizeof(long)];
         BinaryPrimitives.WriteInt64LittleEndian(buffer, value);
         return ctx.Memory.TryWrite(address, buffer);
+    }
+
+    private static void TracePlayGo(string message)
+    {
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PLAYGO"), "1", StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] playgo.{message}");
+        }
+    }
+
+    private static void TracePlayGoLocus(uint entries, ulong chunkIds, ulong outLoci)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_PLAYGO"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        var count = Interlocked.Increment(ref _locusTraceDiagnostics);
+        if (entries != 1 || count <= 32 || count % 1000 == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] playgo.get_locus entries={entries} chunk_ids=0x{chunkIds:X16} out=0x{outLoci:X16}");
+        }
     }
 
     private sealed record PlayGoMetadata(bool Available, ushort[] ChunkIds)
